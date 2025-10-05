@@ -21,7 +21,16 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2.3", features = [] }
 tauri-plugin-opener = "2.3"
 tauri-plugin-sql = { version = "2.3", features = ["sqlite"] }
+tauri-plugin-dialog = "2.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 arboard = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+rdev = "0.5"
+enigo = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+accessibility-sys = "0.1"
+core-foundation = "0.9"
 

@@ -1,8 +1,11 @@
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { initDB, getSnippets, createSnippet, updateSnippet, deleteSnippet } from "./db";
 import type { Snippet, RaycastSnippet } from "./types";
 import { extractArguments } from "./parser";
 import { executeSnippet, copyToClipboard } from "./executor";
+import { logger } from "./logger";
 import "./App.css";
 
 function App() {
@@ -24,9 +27,82 @@ function App() {
   const [importText, setImportText] = useState("");
   const [importPreview, setImportPreview] = useState<RaycastSnippet[] | null>(null);
 
+  // Auto-expansion state
+  const [autoExpansionEnabled, setAutoExpansionEnabled] = useState(false);
+  const [showPermissionGuide, setShowPermissionGuide] = useState(false);
+  const [hasAccessibilityPermissions, setHasAccessibilityPermissions] = useState<boolean | null>(null);
+
   useEffect(() => {
     loadSnippets();
+    enableAutoExpansionOnStartup();
   }, []);
+
+  useEffect(() => {
+    // Sync active snippets to backend whenever they change
+    syncSnippetsToBackend();
+  }, [snippets]);
+
+  async function enableAutoExpansionOnStartup() {
+    try {
+      await invoke("enable_auto_expansion");
+      setAutoExpansionEnabled(true);
+      logger.info("Auto-expansion enabled on startup");
+
+      // Check if accessibility permissions are granted
+      setTimeout(async () => {
+        await checkPermissions();
+      }, 1000);
+    } catch (error) {
+      logger.error("Failed to enable auto-expansion", { error });
+      setAutoExpansionEnabled(false);
+      setShowPermissionGuide(true);
+    }
+  }
+
+  async function checkPermissions() {
+    try {
+      const hasPermissions = await invoke<boolean>("check_accessibility_permissions");
+      setHasAccessibilityPermissions(hasPermissions);
+      logger.info("Accessibility permissions check", { hasPermissions });
+
+      if (!hasPermissions) {
+        setShowPermissionGuide(true);
+      }
+    } catch (error) {
+      logger.error("Failed to check permissions", { error });
+      setHasAccessibilityPermissions(false);
+    }
+  }
+
+  async function syncSnippetsToBackend() {
+    const activeSnippets = snippets.filter((s) => s.active);
+    const keywords = activeSnippets.map((s) => s.keyword);
+    const texts = activeSnippets.map((s) => s.text);
+
+    try {
+      await invoke("update_snippets_map", { keywords, texts });
+      logger.debug("Snippets synced to backend", { count: activeSnippets.length });
+    } catch (error) {
+      logger.error("Failed to sync snippets", { error });
+    }
+  }
+
+  async function toggleAutoExpansion() {
+    try {
+      if (autoExpansionEnabled) {
+        await invoke("disable_auto_expansion");
+        setAutoExpansionEnabled(false);
+        logger.info("Auto-expansion disabled");
+      } else {
+        await invoke("enable_auto_expansion");
+        setAutoExpansionEnabled(true);
+        logger.info("Auto-expansion enabled");
+      }
+    } catch (error) {
+      logger.error("Failed to toggle auto-expansion", { error });
+      alert("Failed to toggle auto-expansion. Check console logs.");
+    }
+  }
 
   async function loadSnippets() {
     setIsLoading(true);
@@ -115,6 +191,33 @@ function App() {
     setImportPreview(null);
   }
 
+  async function handleImportFile() {
+    const file = await open({
+      title: "Select Raycast Snippets JSON",
+      filters: [{ name: "JSON", extensions: ["json"] }],
+      multiple: false,
+    });
+
+    if (!file) return;
+
+    try {
+      const response = await fetch(`file://${file}`);
+      const text = await response.text();
+      const parsed = JSON.parse(text) as RaycastSnippet[];
+
+      if (!Array.isArray(parsed)) throw new Error("Must be an array");
+      if (parsed.some((s) => !s.keyword || !s.name || !s.text)) {
+        throw new Error("Invalid format: missing required fields");
+      }
+
+      setImportText(text);
+      setImportPreview(parsed);
+      setIsImportOpen(true);
+    } catch (error) {
+      alert(`Failed to import file: ${error instanceof Error ? error.message : "Unknown error"}`);
+    }
+  }
+
   function handleExport() {
     const exportData: RaycastSnippet[] = snippets.map((s) => ({
       keyword: s.keyword,
@@ -141,13 +244,38 @@ function App() {
     <div className="min-h-screen bg-gray-50 p-8">
       <div className="max-w-4xl mx-auto">
         <div className="flex justify-between items-center mb-6">
-          <h1 className="text-3xl font-bold text-gray-900">Snippet Runner</h1>
+          <div className="flex items-center gap-4">
+            <h1 className="text-3xl font-bold text-gray-900">Snippet Runner</h1>
+            <div className="flex flex-col gap-1">
+              <button
+                onClick={toggleAutoExpansion}
+                className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                  autoExpansionEnabled
+                    ? "bg-green-600 text-white hover:bg-green-700"
+                    : "bg-gray-300 text-gray-700 hover:bg-gray-400"
+                }`}
+              >
+                {autoExpansionEnabled ? "✓ Auto-Expand ON" : "Auto-Expand OFF"}
+              </button>
+              {autoExpansionEnabled && (
+                <p className="text-xs text-gray-600">
+                  Requires Accessibility permissions (System Settings → Privacy & Security)
+                </p>
+              )}
+            </div>
+          </div>
           <div className="flex gap-2">
             <button
               onClick={() => setIsImportOpen(true)}
               className="bg-gray-600 text-white px-4 py-2 rounded-lg hover:bg-gray-700"
             >
-              Import
+              Import (Paste)
+            </button>
+            <button
+              onClick={handleImportFile}
+              className="bg-gray-600 text-white px-4 py-2 rounded-lg hover:bg-gray-700"
+            >
+              Import File
             </button>
             <button
               onClick={handleExport}
@@ -474,6 +602,70 @@ function App() {
                   </div>
                 </>
               )}
+            </div>
+          </div>
+        )}
+
+        {/* Permission Guide Modal */}
+        {showPermissionGuide && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-lg p-6 max-w-lg w-full">
+              <h2 className="text-xl font-bold mb-4">🔐 Activer l'Auto-Expansion</h2>
+
+              <div className="mb-6">
+                {/* Permission Status */}
+                {hasAccessibilityPermissions !== null && (
+                  <div className={`mb-4 p-3 rounded-lg border ${
+                    hasAccessibilityPermissions
+                      ? 'bg-green-50 border-green-200'
+                      : 'bg-red-50 border-red-200'
+                  }`}>
+                    <p className={`text-sm font-semibold ${
+                      hasAccessibilityPermissions ? 'text-green-900' : 'text-red-900'
+                    }`}>
+                      {hasAccessibilityPermissions
+                        ? '✅ Permissions activées - L\'auto-expansion fonctionne !'
+                        : '❌ Permissions manquantes - Suivez les étapes ci-dessous'}
+                    </p>
+                  </div>
+                )}
+
+                <p className="text-gray-700 mb-4">
+                  Pour que l'auto-expansion fonctionne, vous devez autoriser l'app à accéder au clavier.
+                </p>
+
+                <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+                  <h3 className="font-semibold text-blue-900 mb-2">Étapes à suivre :</h3>
+                  <ol className="list-decimal list-inside space-y-2 text-sm text-blue-900">
+                    <li>Ouvrez <strong>Réglages Système</strong> (System Settings)</li>
+                    <li>Allez dans <strong>Confidentialité et sécurité</strong> (Privacy & Security)</li>
+                    <li>Cliquez sur <strong>Accessibilité</strong> (Accessibility)</li>
+                    <li>Cliquez sur le <strong>+</strong> et ajoutez <strong>snippet-app</strong></li>
+                    <li>Cochez la case à côté de l'app</li>
+                  </ol>
+                </div>
+
+                <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3">
+                  <p className="text-sm text-yellow-900">
+                    ⚠️ Vous devrez peut-être redémarrer l'app après avoir activé les permissions.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-3">
+                <button
+                  onClick={checkPermissions}
+                  className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700"
+                >
+                  🔄 Vérifier à nouveau
+                </button>
+                <button
+                  onClick={() => setShowPermissionGuide(false)}
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                >
+                  {hasAccessibilityPermissions ? 'Fermer' : 'J\'ai compris'}
+                </button>
+              </div>
             </div>
           </div>
         )}
